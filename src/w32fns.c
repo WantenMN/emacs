@@ -276,6 +276,15 @@ extern AppendMenuW_Proc unicode_append_menu;
 /* Flag to selectively ignore WM_IME_CHAR messages.  */
 static int ignore_ime_char = 0;
 
+/* Fixed buffer for receiving IME composition (preedit) string.  */
+static wchar_t *composition_ime_data;
+
+/* Used to preserve the position of the IME window during the WM_IME_COMPOSITION event,
+   preventing other events from updating the w32_system_caret_x variable and
+   causing the IME window's x position to jitter,
+   in order to remain consistent with Windows' default behavior.  */
+static int composition_ime_pt_x = -1;
+
 /* W95 mousewheel handler */
 extern unsigned int msh_mousewheel;
 unsigned int msh_mousewheel = 0;
@@ -5068,15 +5077,35 @@ w32_wnd_proc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	  form.ptCurrentPos.x = w32_system_caret_x;
 	  form.ptCurrentPos.y = w32_system_caret_y;
 
-	  form.rcArea.left = WINDOW_TEXT_TO_FRAME_PIXEL_X (w, 0);
-	  form.rcArea.top = (WINDOW_TOP_EDGE_Y (w)
-			     + w32_system_caret_hdr_height);
-	  form.rcArea.right = (WINDOW_BOX_RIGHT_EDGE_X (w)
-			       - WINDOW_RIGHT_MARGIN_WIDTH (w)
-			       - WINDOW_RIGHT_FRINGE_WIDTH (w));
-	  form.rcArea.bottom = (WINDOW_BOTTOM_EDGE_Y (w)
-				- WINDOW_BOTTOM_DIVIDER_WIDTH (w)
-				- w32_system_caret_mode_height);
+	  if (w32_ime_preedit)
+	    {
+	      if (composition_ime_pt_x > 0)
+		form.ptCurrentPos.x = composition_ime_pt_x;
+	      /* After hiding the preedit window, the original position is
+		 a bit too high.  Subtracting half the font pixel size gives
+		 better vertical centering.  The extra 2 pixels prevent the
+		 window from touching the edge.  */
+	      form.ptCurrentPos.y -= -FRAME_FONT (f)->pixel_size / 2 - 2;
+	      /* Set rcArea left and top to negative values to hide the preedit window.
+		 Removing the ISC_SHOWUICOMPOSITIONWINDOW flag from lParam in
+		 WM_IME_SETCONTEXT has no effect.
+		 See: https://learn.microsoft.com/en-us/windows/win32/intl/wm-ime-setcontext
+		 So we move the constraint area offscreen instead.  */
+	      form.rcArea.left = -LONG_MAX;
+	      form.rcArea.top = -LONG_MAX;
+	    }
+	  else
+	    {
+	      form.rcArea.left = WINDOW_TEXT_TO_FRAME_PIXEL_X (w, 0);
+	      form.rcArea.top = (WINDOW_TOP_EDGE_Y (w)
+				 + w32_system_caret_hdr_height);
+	      form.rcArea.right = (WINDOW_BOX_RIGHT_EDGE_X (w)
+				   - WINDOW_RIGHT_MARGIN_WIDTH (w)
+				   - WINDOW_RIGHT_FRINGE_WIDTH (w));
+	      form.rcArea.bottom = (WINDOW_BOTTOM_EDGE_Y (w)
+				    - WINDOW_BOTTOM_DIVIDER_WIDTH (w)
+				    - w32_system_caret_mode_height);
+	    }
 
 	  /* Punt if the window was deleted behind our back.  */
 	  if (!BUFFERP (w->contents))
@@ -5100,8 +5129,48 @@ w32_wnd_proc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	 supported by the input method...  */
       goto dflt;
 
+    case WM_IME_COMPOSITION:
+      if (!w32_ime_preedit)
+	goto dflt;
+
+      if (lParam & GCS_RESULTSTR)
+	{
+	  composition_ime_pt_x = -1;
+	  my_post_msg (&wmsg, hwnd, msg, (WPARAM) "", 0);
+	}
+      else if (lParam & (GCS_COMPSTR | GCS_CURSORPOS))
+	{
+	  int size = 0;
+	  int cursor_pos = 0;
+	  HIMC context = get_ime_context_fn (hwnd);
+
+	  if (composition_ime_pt_x < 0)
+	    composition_ime_pt_x = w32_system_caret_x;
+
+	  free (composition_ime_data);
+	  composition_ime_data = NULL;
+
+	  size = get_composition_string_fn (context, GCS_COMPSTR, NULL, 0);
+	  composition_ime_data = malloc (size  + sizeof (cursor_pos));
+	  size = get_composition_string_fn (context, GCS_COMPSTR,
+					    composition_ime_data, size);
+	  cursor_pos = get_composition_string_fn (context, GCS_CURSORPOS,
+						  NULL, 0);
+	  /* offset end, write cursor position.  */
+	  memcpy ((char *) composition_ime_data + size,
+		  &cursor_pos, sizeof (cursor_pos));
+	  release_ime_context_fn (hwnd, context);
+
+	  my_post_msg (&wmsg, hwnd, msg,
+		       (WPARAM) composition_ime_data, size);
+	  break;
+	}
+
+      goto dflt;
+
     case WM_IME_ENDCOMPOSITION:
       ignore_ime_char = 0;
+      composition_ime_pt_x = -1;
       goto dflt;
 
       /* Simulate middle mouse button events when left and right buttons

@@ -5399,6 +5399,45 @@ w32_read_socket (struct terminal *terminal,
 	    }
 	  break;
 
+	case WM_IME_COMPOSITION:
+	  {
+	    f = w32_window_to_frame (dpyinfo, msg.msg.hwnd);
+	    Lisp_Object str = Qnil;
+	    int size = (int) msg.msg.lParam;
+
+	    if (size > 0)
+	      {
+		int cursor_pos;
+		int utf8_len;
+		char *utf8_buf;
+		wchar_t *wbuf = (wchar_t *) msg.msg.wParam;
+		utf8_len = WideCharToMultiByte (CP_UTF8, 0,
+						wbuf, size / sizeof(wchar_t),
+						NULL, 0,
+						NULL, NULL);
+		utf8_buf = alloca (utf8_len);
+		utf8_len = WideCharToMultiByte(CP_UTF8, 0,
+					       wbuf, size / sizeof(wchar_t),
+					       utf8_buf, utf8_len,
+					       NULL, NULL);
+		str = make_string_from_utf8 (utf8_buf, utf8_len);
+
+                /* offaet end, read cursor position.  */
+		memcpy (&cursor_pos, (char *) wbuf + size, sizeof (cursor_pos));
+                /* see xic_preedit_draw_callback function.  */
+		Fput_text_property (make_fixnum (min (SCHARS (str), max (0, cursor_pos))),
+				    make_fixnum (min (SCHARS (str), max (0, cursor_pos) + 1)),
+				    Qcursor, Qt, str);
+	      }
+
+	    inev.kind = PREEDIT_TEXT_EVENT;
+	    inev.arg = str;
+	    inev.modifiers = msg.dwModifiers;
+	    XSETFRAME (inev.frame_or_window, f);
+	    inev.timestamp = msg.msg.time;
+	  }
+	  break;
+
         case WM_APPCOMMAND:
 	  f = w32_window_to_frame (dpyinfo, msg.msg.hwnd);
 
@@ -8408,6 +8447,13 @@ of wrapped menu bar lines.  If this is non-nil, Emacs adds the height of
 wrapped menu bar lines when sending frame resize requests to the Windows
 API.  */);
   w32_add_wrapped_menu_bar_lines = 1;
+
+  DEFVAR_BOOL ("w32-ime-preedit",
+	       w32_ime_preedit,
+	       doc: /* Non-nil means report IME preedit strings to
+`w32-ime-composition-hook'.  When nil, the IME preedit is not
+reported and the IME works as normal.  */);
+  w32_ime_preedit = 0;
 
   /* Tell Emacs about this window system.  */
   Fprovide (Qw32, Qnil);
