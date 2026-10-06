@@ -621,6 +621,38 @@ default font on FRAME, or its best approximation."
     (clear-font-cache)
     (and val (setq w32-non-USB-fonts val))))
 
+;; The preedit rendering code below is adapted from x-win.el,
+;; with the variable and function prefixes changed to w32 and a few minor modifications.
+(defvar w32-preedit-overlay nil
+  "The overlay currently used to display preedit text from a compose sequence.")
+
+(defun w32-clear-preedit-text ()
+  "Clear the pre-edit overlay and remove itself from `pre-command-hook'.
+This function should be installed in `pre-command-hook' whenever
+preedit text is displayed."
+  (when w32-preedit-overlay
+    (delete-overlay w32-preedit-overlay)
+    (setq w32-preedit-overlay nil))
+  (remove-hook 'pre-command-hook #'w32-clear-preedit-text))
+
+(defun w32-preedit-text (event)
+  "Display preedit text from a compose sequence in EVENT.
+EVENT is a preedit-text event."
+  (interactive "e")
+  (when w32-ime-preedit
+    (when w32-preedit-overlay
+      (delete-overlay w32-preedit-overlay)
+      (setq w32-preedit-overlay nil)
+      (remove-hook 'pre-command-hook #'w32-clear-preedit-text))
+    (when (nth 1 event)
+      (let ((string (propertize (nth 1 event) 'face '(:underline t))))
+        (setq w32-preedit-overlay (make-overlay (point) (point)))
+        (add-hook 'pre-command-hook #'w32-clear-preedit-text)
+        (overlay-put w32-preedit-overlay 'window (selected-window))
+        (overlay-put w32-preedit-overlay 'before-string string)))))
+
+(define-key special-event-map [preedit-text] 'w32-preedit-text)
+
 (provide 'w32-win)
 (provide 'term/w32-win)
 
