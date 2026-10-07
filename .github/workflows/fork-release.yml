@@ -1,0 +1,318 @@
+# Fork release builds for GNU Emacs.
+#
+# Triggered by pushing a tag that points at a commit containing this workflow
+# (i.e. the HEAD of the fork branch):
+#   git tag v32.0.50-fork.1
+#   git push origin v32.0.50-fork.1
+#
+# Two independent legs, each publishing its own asset to the GitHub release on
+# the tag as soon as it finishes. Neither leg waits for the other; whichever
+# gets there first creates the release and the other just adds its asset:
+#   emacs-<version>-linux-x86_64-pgtk.tar.gz   (GNU tarball, tree under usr/)
+#   emacs-<version>-windows-x86_64-w64.zip     (self-contained: every MinGW-w64
+#                                               DLL Emacs needs is copied into
+#                                               bin/, so no MSYS2 required)
+#
+# <version> is AC_INIT's second argument in configure.ac (32.0.50 right now),
+# *not* the tag, so the artifact names stay stable across re-tags. The tag only
+# picks which release they land in. Consequence: two different tags built from
+# the same configure.ac produce identically named assets in two different
+# releases, which is what we want.
+#
+# Deliberately secret-free: everything here uses only the automatic
+# GITHUB_TOKEN, so no repo settings need configuring beyond having Actions
+# enabled.
+#
+# There is no `make check`: the build is only ever run on tags, and Emacs' test
+# suite needs a working X/Wayland display plus has a history of flaky cases, so
+# a failure here would block releases without catching fork-specific breakage.
+#
+# NOTE before editing: .gitignore ignores every dot-file (`.*`), .github/
+# included. Both files here are tracked via `git add -f`, but a *new* file
+# added under .github/ needs `git add -f` too or it is silently skipped and the
+# workflow quietly never runs.
+
+name: Fork Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual trigger for testing the recipe without burning a tag. Leave
+  # `publish_tag` empty to build and upload run artifacts only.
+  workflow_dispatch:
+    inputs:
+      publish_tag:
+        description: 'Existing tag to publish under; empty = artifacts only'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release-${{ github.ref }}-${{ inputs.publish_tag }}
+  # Never cancel a release build half-way; a retag must be able to retry.
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: linux-x86_64-pgtk
+    runs-on: ubuntu-latest
+    # pgtk + native-comp is a full rebuild of src/ and lib/ every time; 90 is
+    # comfortable headroom over the ~30min observed on a 4-core runner.
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      CCACHE_DIR: ${{ runner.temp }}/ccache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Emacs' history is huge; we only ever need the tagged tree.
+          fetch-depth: 1
+
+      - name: read version from configure.ac
+        id: ver
+        shell: bash
+        run: |
+          version="$(sed -n 's/^AC_INIT(\[GNU Emacs\], *\[\([^]]*\)\].*/\1/p' configure.ac | head -1)"
+          if [ -z "$version" ]; then
+            echo "::error::could not read the version from configure.ac"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Emacs' own object files cannot be cached with actions/cache: a fresh
+      # checkout always has newer mtimes than restored objects, so make would
+      # rebuild everything anyway. ccache keys on preprocessed content instead,
+      # which is what actually makes a re-tag cheap.
+      - name: restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-linux-${{ hashFiles('configure.ac', 'src/**', 'lib/**') }}
+          restore-keys: |
+            ccache-linux-
+
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          # libgccjit is versioned after the GCC it belongs to
+          # (libgccjit-14-dev on noble); a bare libgccjit-dev only exists in
+          # some releases, so ask apt which name this runner has.
+          gccjit_dev="$(apt-cache pkgnames | grep -E '^libgccjit(-[0-9]+)?-dev$' | sort -V | tail -1)"
+          if [ -z "$gccjit_dev" ]; then
+            echo "::error::no libgccjit dev package available; native-comp cannot be built"
+            exit 1
+          fi
+          echo "using $gccjit_dev for native compilation"
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake make m4 pkg-config texinfo ccache \
+            "$gccjit_dev" \
+            libgtk-3-dev libglib2.0-dev libcairo2-dev \
+            libharfbuzz-dev libfreetype6-dev \
+            libx11-dev libxcb1-dev libxext-dev libxrender-dev libxt-dev \
+            libxfixes-dev libxi-dev libxinerama-dev libxkbfile-dev libxmu-dev \
+            libxpm-dev libjpeg-dev libpng-dev libtiff-dev librsvg2-dev \
+            libwebp-dev liblcms2-dev libxml2-dev libsqlite3-dev libdbus-1-dev \
+            libz-dev
+
+      - name: autogen
+        run: ./autogen.sh
+
+      # --with-pgtk is OPTION_DEFAULT_OFF in configure.ac, so it is mandatory
+      # here. Under `case $window_system in pgtk)` (configure.ac:3156) the
+      # toolkit selection is ignored and GTK3 + USE_X_TOOLKIT=none are forced,
+      # so --with-x-toolkit=no only skips the (unused) X11 probe.
+      # --with-native-compilation=yes is the default anyway when libgccjit is
+      # found, but stating it turns a missing libgccjit into a hard error here
+      # rather than a silently feature-less binary.
+      - name: configure
+        run: |
+          ./configure \
+            --prefix=/usr \
+            --with-pgtk \
+            --with-x-toolkit=no \
+            --with-native-compilation=yes \
+            --with-zlib --with-xpm --with-jpeg --with-png --with-tiff \
+            --with-webp --with-rsvg --with-lcms2 --with-xml2 --with-sqlite3 \
+            --with-gsettings --with-dbus \
+            CC="ccache gcc" \
+            CFLAGS="-O2 -g0 -pipe" \
+            LDFLAGS="-Wl,-O1"
+
+      - name: build
+        run: |
+          make -j"$(nproc)"
+          ccache --show-stats || true
+
+      # DESTDIR + --prefix=/usr: the tarball contains usr/bin/emacs,
+      # usr/share/emacs/<version>/lisp, ... with a consistent /usr layout, so
+      # extracting it anywhere gives a working `usr/bin/emacs -Q`.
+      - name: stage and package
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -e
+          stage="$RUNNER_TEMP/stage"
+          make install DESTDIR="$stage"
+          mkdir -p "$RUNNER_TEMP/dist"
+          tar -czf "$RUNNER_TEMP/dist/emacs-${VERSION}-linux-x86_64-pgtk.tar.gz" \
+              -C "$stage" usr
+
+      - name: upload run artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: emacs-linux-x86_64-pgtk
+          path: ${{ runner.temp }}/dist/emacs-*-linux-x86_64-pgtk.tar.gz
+          if-no-files-found: error
+
+      - name: publish to GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          ASSET: ${{ runner.temp }}/dist/emacs-${{ steps.ver.outputs.version }}-linux-x86_64-pgtk.tar.gz
+          RELEASE_TAG: ${{ inputs.publish_tag || github.ref_name }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish_tag != '' }}
+        run: bash .github/workflows/publish-release.sh
+
+  windows:
+    name: windows-x86_64-w64
+    runs-on: windows-latest
+    # Native-comp on top of the MSYS2 toolchain install; be generous.
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      # This has to happen before checkout. The Windows runner image ships
+      # core.autocrlf=true, and Emacs' .gitattributes does not override the
+      # eol setting, so a checkout would rewrite configure, Makefile.in and
+      # everything else to CRLF and break the build in confusing ways.
+      - name: keep git from converting line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: read version from configure.ac
+        id: ver
+        shell: bash
+        run: |
+          version="$(sed -n 's/^AC_INIT(\[GNU Emacs\], *\[\([^]]*\)\].*/\1/p' configure.ac | head -1)"
+          if [ -z "$version" ]; then
+            echo "::error::could not read the version from configure.ac"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install-type: mingw
+          update: true
+          cache: true
+          release: false
+          # strict prepends /mingw64/bin ahead of /usr/bin so the MinGW-w64
+          # gcc/make/pkg-config win; `inherit` would put the MSYS make first
+          # and configure would not find the right toolchain.
+          path-type: strict
+
+      # Package list follows nt/INSTALL.W64, minus the tree-sitter entries:
+      # the MSYS2 package was renamed from libtree-sitter to tree-sitter and
+      # configure only warns (OPTION_DEFAULT_IFAVAILABLE) when it is missing.
+      - name: install build dependencies
+        run: |
+          # setup-msys2's `update: true` can leave the "restart required"
+          # half-upgrade behind; run it once more before installing.
+          pacman -Syyuu --noconfirm || echo "::warning::pacman -Syyuu failed; continuing anyway"
+          pacman -S --needed --noconfirm \
+            autoconf automake base-devel git make patch m4 pkgconf zip \
+            mingw-w64-x86_64-gcc \
+            mingw-w64-x86_64-make \
+            mingw-w64-x86_64-pkgconf \
+            mingw-w64-x86_64-texinfo \
+            mingw-w64-x86_64-gmp \
+            mingw-w64-x86_64-gnutls \
+            mingw-w64-x86_64-harfbuzz \
+            mingw-w64-x86_64-libgccjit \
+            mingw-w64-x86_64-libtiff \
+            mingw-w64-x86_64-libwebp \
+            mingw-w64-x86_64-libjpeg-turbo \
+            mingw-w64-x86_64-libpng \
+            mingw-w64-x86_64-giflib \
+            mingw-w64-x86_64-librsvg \
+            mingw-w64-x86_64-lcms2 \
+            mingw-w64-x86_64-libxml2 \
+            mingw-w64-x86_64-sqlite3 \
+            mingw-w64-x86_64-xpm-nox \
+            mingw-w64-x86_64-ntldd
+
+      - name: autogen
+        run: ./autogen.sh
+
+      # --without-dbus is what nt/INSTALL.W64 prescribes: Emacs still lacks
+      # D-Bus support on Windows.
+      - name: configure
+        run: |
+          ./configure \
+            --prefix=/c/emacs-dist/emacs \
+            --without-dbus \
+            --with-native-compilation=yes \
+            --with-zlib --with-libgmp --with-xpm --with-jpeg --with-png \
+            --with-tiff --with-webp --with-rsvg --with-lcms2 --with-xml2 \
+            --with-sqlite3 --with-harfbuzz \
+            CFLAGS="-O2 -g0"
+
+      - name: build
+        run: make -j"$(nproc)"
+
+      # Copy every MinGW-w64 DLL the installed binaries pull in next to them so
+      # the zip runs on a machine with no MSYS2 and no PATH tweaks; see
+      # nt/INSTALL.W64, "Test Emacs". ntldd writes into a separate directory
+      # first so it never scans its own output, and it already skips the
+      # api-ms-win-* / kernel32.dll style system libraries.
+      - name: install and collect runtime DLLs
+        run: |
+          make install
+          mkdir -p /c/emacs-dist/dlls
+          ntldd -R /c/emacs-dist/emacs/bin -w /c/emacs-dist/dlls
+          cp -f /c/emacs-dist/dlls/*.dll /c/emacs-dist/emacs/bin/
+          rm -rf /c/emacs-dist/dlls
+
+      - name: package
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -e
+          cd /c/emacs-dist
+          # Default (-6) compression: -9 on ~400MB of mostly-already-compact
+          # files costs minutes for very little size.
+          zip -r "emacs-${VERSION}-windows-x86_64-w64.zip" emacs
+
+      - name: upload run artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: emacs-windows-x86_64-w64
+          # upload-artifact runs on Node, not in the MSYS2 shell, so it needs a
+          # real Windows path here rather than the /c/... the build produced.
+          path: C:/emacs-dist/emacs-*-windows-x86_64-w64.zip
+          if-no-files-found: error
+
+      - name: publish to GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          ASSET: /c/emacs-dist/emacs-${{ steps.ver.outputs.version }}-windows-x86_64-w64.zip
+          RELEASE_TAG: ${{ inputs.publish_tag || github.ref_name }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish_tag != '' }}
+        run: bash .github/workflows/publish-release.sh
