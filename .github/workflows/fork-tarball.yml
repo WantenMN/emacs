@@ -50,11 +50,21 @@ jobs:
         shell: bash --noprofile --norc -eo pipefail {0}
         run: |
           sudo apt-get update
+          # build-dep needs deb-src entries (absent from runner images).
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+            sudo apt-get update
+          fi
           # Base set from the distro emacs recipe, plus pgtk/native-comp extras.
-          sudo apt-get build-dep -y emacs
-          sudo apt-get install -y autoconf texinfo pkg-config \
-            libgtk-3-dev libtree-sitter-dev libjansson-dev \
-            libharfbuzz-dev libotf-dev libm17n-dev || true
+          if ! sudo apt-get build-dep -y emacs; then
+            sudo apt-get install -y autoconf texinfo pkg-config \
+              libgtk-3-dev libgnutls28-dev libsqlite3-dev libdbus-1-dev \
+              libotf-dev libm17n-dev libharfbuzz-dev libjpeg-dev \
+              libpng-dev libgif-dev libtiff-dev librsvg2-dev \
+              libwebp-dev liblcms2-dev libjansson-dev libgmp-dev \
+              libtree-sitter-dev libncurses-dev libxml2-dev zlib1g-dev \
+              libsystemd-dev
+          fi
           # libgccjit dev package is versioned; try unversioned then fall back.
           sudo apt-get install -y libgccjit-dev \
             || sudo apt-get install -y libgccjit-13-dev \
