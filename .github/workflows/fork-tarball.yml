@@ -115,6 +115,8 @@ jobs:
           sed -i "s|__VENDOR_TS__|$PWD/vendor-ts|" vendor-ts/lib/pkgconfig/tree-sitter.pc
           cat vendor-ts/lib/pkgconfig/tree-sitter.pc
           echo "PKG_CONFIG_PATH=$PWD/vendor-ts/lib/pkgconfig" >> "$GITHUB_ENV"
+          # temacs (bootstrap) must load the vendored lib at build time.
+          echo "LD_LIBRARY_PATH=$PWD/vendor-ts/lib" >> "$GITHUB_ENV"
           ls -l vendor-ts/lib/
 
       - name: Autogen + configure (pgtk, prefix /usr)
