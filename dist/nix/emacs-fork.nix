@@ -14,7 +14,6 @@
 , giflib
 , gtk3
 , libxpm
-, libjpeg
 , libpng
 , librsvg
 , libtiff
@@ -69,7 +68,6 @@ stdenv.mkDerivation rec {
     giflib
     gtk3
     libxpm
-    libjpeg
     libpng
     librsvg
     libtiff
