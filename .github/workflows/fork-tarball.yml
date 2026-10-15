@@ -246,6 +246,30 @@ jobs:
           # The wrapper sets EMACSLOADPATH + dump file; cc-mode proves the
           # relocated lisp tree resolves (subdirs auto-added).
           "$out/bin/emacs" --batch --eval "(progn (require 'cc-mode) (kill-emacs 0))"
+          # Relocation + launcher regressions: bare Icon=emacs (fuzzel
+          # resolves via hicolor), no stale /usr paths, exec dir + native
+          # toolchain provided by the wrapper. These failed silently before
+          # because batch byte-compile exits 0 even with warnings on stderr.
+          grep -q '^Icon=emacs$' "$out/share/applications/emacs.desktop"
+          ! grep -rq '/usr/bin\|/usr/share' "$out/share/applications/"
+          grep -q 'EMACSPATH' "$out/bin/emacs"
+          grep -q 'binutils' "$out/bin/emacs"
+          err=$("$out/bin/emacs" --batch \
+            --eval "(progn (require 'cc-mode) (message \"exec %s\" exec-directory) (kill-emacs 0))" 2>&1)
+          echo "$err"
+          if echo "$err" | grep -q 'arch-dependent data dir'; then
+            echo "error: exec-directory still points at /usr" >&2
+            exit 1
+          fi
+          # Native-compile smoke with a clean env so only the wrapper's
+          # PATH (gcc-wrapper + binutils for `as`) can satisfy the driver.
+          # Without it this fails with: cannot execute 'as'.
+          mkdir -p /tmp/eln-smoke
+          printf ';;; smoke.el --- ci native-compile smoke  -*- lexical-binding: t; -*-\n(defun eln-smoke-add (a b) (+ a b))\n(provide (quote smoke))\n' > /tmp/eln-smoke/smoke.el
+          env -i HOME=/tmp/eln-smoke PATH=/usr/bin:/bin \
+            "$out/bin/emacs" --batch \
+            --eval "(progn (setq native-comp-eln-load-path '(\"/tmp/eln-smoke/eln\")) (native-compile \"/tmp/eln-smoke/smoke.el\") (kill-emacs 0))"
+          ls /tmp/eln-smoke/eln/*/*.eln
 
       - name: Prune old versioned releases (keep newest)
         # Old versions are separate releases so stale machines can reinstall

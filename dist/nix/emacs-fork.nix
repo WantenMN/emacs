@@ -3,6 +3,7 @@
 , fetchurl
 , autoPatchelfHook
 , makeWrapper
+, binutils
 , gnutls
 , harfbuzz
 , ncurses
@@ -38,6 +39,21 @@
 # NOTE: native-comp .eln files ship in the tarball (built against Ubuntu's
 # libgccjit, rewritten by autoPatchelf). If JIT/AOT misbehaves on NixOS,
 # delete $out/lib/emacs/*/native-lisp and rely on bytecode.
+let
+  # Mirrors nixpkgs make-emacs.nix libGccJitLibraryPaths, plus the gcc
+  # lib/output dirs providing libgcc_s_asneeded / libatomic_asneeded and
+  # crtbeginS.o. The prebuilt binary's JIT driver never sees gcc-wrapper's
+  # -B flags, so the driver subprocess needs these via LIBRARY_PATH.
+  libGccJitLibraryPaths = [
+    "${lib.getLib libgccjit}/lib/gcc"
+    "${lib.getLib stdenv.cc.libc}/lib"
+    "${lib.getLib stdenv.cc.cc}/lib"
+    "${lib.getLib stdenv.cc.cc}/lib/gcc/${stdenv.targetPlatform.config}/${stdenv.cc.version}"
+    "${stdenv.cc.cc.lib}/lib"
+  ] ++ lib.optionals (stdenv.cc ? cc.lib.libgcc) [
+    "${lib.getLib stdenv.cc.cc.lib.libgcc}/lib"
+  ];
+in
 stdenv.mkDerivation rec {
   pname = "emacs-fork";
   version = "0.0.0-unset";
@@ -98,28 +114,52 @@ stdenv.mkDerivation rec {
       [ -e "$d" ] && cp -r "$d" "$out/"
     done
 
-    # Desktop files may bake the /usr bindir or use bare names depending on
-    # the toolkit build; normalize any form to the store wrapper.
-    for f in $out/share/applications/emacs.desktop \
-             $out/share/applications/emacsclient.desktop \
-             $out/share/applications/emacs-mail.desktop; do
+    # Desktop files: only rewrite absolute /usr paths. A bare Icon=emacs
+    # must stay bare so launchers (fuzzel/rofi) resolve it via the
+    # hicolor theme under $out/share/icons (wrapper provides XDG_DATA_DIRS).
+    for f in "$out"/share/applications/*.desktop; do
       [ -f "$f" ] || continue
       grep -q '^Exec=' "$f" || { echo "error: no Exec= in $f" >&2; exit 1; }
       sed -i -E \
         -e "s|^Exec=(/usr/bin/)?|Exec=$out/bin/|" \
         -e "s|^TryExec=(/usr/bin/)?|TryExec=$out/bin/|" \
-        -e "s|^Icon=(/usr/share/)?|Icon=$out/share/|" \
+        -e "s|^Icon=/usr/share/|Icon=$out/share/|" \
         "$f"
+      # emacsclient.desktop embeds /usr/bin/emacsclient inside `sh -c "..."`;
+      # line-anchored rules above miss those.
+      sed -i "s|/usr/bin|$out/bin|g" "$f"
     done
+
+    # /usr/bin and /usr/share must be fully gone from desktop entries;
+    # Icon=emacs stays bare (resolved via hicolor theme).
+    ! grep -rq '/usr/bin\|/usr/share' "$out/share/applications/" || {
+      echo "error: stale /usr path in desktop files" >&2
+      grep -rn '/usr/bin\|/usr/share' "$out/share/applications/" >&2
+      exit 1
+    }
+    grep -q '^Icon=emacs$' "$out/share/applications/emacs.desktop" || {
+      echo "error: expected bare Icon=emacs" >&2
+      exit 1
+    }
 
     ever=$(ls "$out/share/emacs/" | grep -E '^[0-9]+\.' | head -n 1)
     test -n "$ever"
     test -d "$out/share/emacs/$ever/lisp"
     pdmp=$(echo "$out"/libexec/emacs/*/*/emacs-*.pdmp)
     test -f "$pdmp"
+    # Binary is built with --prefix=/usr, so epaths.h bakes
+    # /usr/libexec/... as exec-directory fallback (see src/callproc.c:
+    # Vexec_directory comes from EMACSPATH or PATH_EXEC, and the
+    # installation-directory heuristic needs lib-src+etc which an
+    # installed tree has not). Point it at the store copy explicitly.
+    execdir=$(dirname "$pdmp")
+    test -x "$execdir/hexl" || test -x "$execdir/movemail" || test -x "$execdir/rcs2log"
     wrapProgram "$out/bin/emacs" \
       --set EMACSLOADPATH "$out/share/emacs/$ever/lisp" \
       --set EMACSDATA "$out/share/emacs/$ever/etc" \
+      --set EMACSPATH "$execdir" \
+      --prefix PATH : "${lib.makeBinPath [ stdenv.cc binutils ]}" \
+      --suffix LIBRARY_PATH : "${lib.concatStringsSep ":" libGccJitLibraryPaths}" \
       --add-flags "--dump-file=$pdmp" \
       --prefix XDG_DATA_DIRS : "$out/share:${gsettings-desktop-schemas}/share/gsettings-schemas/${gsettings-desktop-schemas.name}:${gtk3}/share/gsettings-schemas/${gtk3.name}"
 
