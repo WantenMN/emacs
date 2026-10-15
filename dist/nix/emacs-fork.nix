@@ -24,6 +24,9 @@
 , libwebp
 , gmp
 , jansson
+, alsa-lib
+, acl
+, attr
 , libotf
 , lcms2
 }:
@@ -76,6 +79,9 @@ stdenv.mkDerivation rec {
     libwebp
     gmp
     jansson
+    alsa-lib
+    acl
+    attr
     libotf
     lcms2
     stdenv.cc.cc.lib
