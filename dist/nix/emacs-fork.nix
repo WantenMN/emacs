@@ -1,0 +1,107 @@
+{ stdenv
+, lib
+, fetchurl
+, autoPatchelfHook
+, makeWrapper
+, gnutls
+, harfbuzz
+, libxml2
+, ncurses
+, dbus
+, gsettings-desktop-schemas
+, glib-networking
+, libgccjit
+, zlib
+, giflib
+, gtk3
+, libxpm
+, libjpeg
+, libpng
+, librsvg
+, libtiff
+, sqlite
+, systemd
+, tree-sitter
+, libwebp
+, gmp
+, jansson
+}:
+
+# Emacs pgtk fork (traditional tarball from GitHub Release).
+# Generated + verified by CI (.github/workflows/fork-tarball.yml):
+#   version/url/hash are filled in by CI on every push to release_fork and
+#   uploaded as release asset `emacs-fork.nix`. This file in dotfiles is a
+#   copy fetched by pkgs/update-fork-tarballs.sh — do not edit hash by hand.
+#
+# NOTE: native-comp .eln files ship in the tarball (built against Ubuntu's
+# libgccjit, rewritten by autoPatchelf). If JIT/AOT misbehaves on NixOS,
+# delete $out/lib/emacs/*/native-lisp and rely on bytecode.
+stdenv.mkDerivation rec {
+  pname = "emacs-fork";
+  version = "0.0.0-unset";
+
+  src = fetchurl {
+    url = "https://github.com/WantenMN/emacs/releases/download/fork-linux-x86_64/emacs-pgtk-linux-x86_64.tar.gz";
+    hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  };
+
+  nativeBuildInputs = [
+    autoPatchelfHook
+    makeWrapper
+  ];
+
+  buildInputs = [
+    gnutls
+    harfbuzz
+    libxml2
+    ncurses
+    dbus
+    gsettings-desktop-schemas
+    glib-networking
+    libgccjit
+    zlib
+    giflib
+    gtk3
+    libxpm
+    libjpeg
+    libpng
+    librsvg
+    libtiff
+    sqlite
+    systemd
+    tree-sitter
+    libwebp
+    gmp
+    jansson
+    stdenv.cc.cc.lib
+  ];
+
+  # Tarball top level is bin/ lib/ libexec/ share/ (contents of stage/usr).
+  installPhase = ''
+    runHook preInstall
+
+    mkdir -p $out
+    for d in bin lib libexec share; do
+      [ -e "$d" ] && cp -r "$d" "$out/"
+    done
+
+    # Desktop files bake the /usr bindir; point them at the store.
+    for f in $out/share/applications/emacs.desktop \
+             $out/share/applications/emacsclient.desktop \
+             $out/share/applications/emacs-mail.desktop; do
+      [ -f "$f" ] && substituteInPlace "$f" \
+        --replace-fail 'Exec=/usr/bin' "Exec=$out/bin" \
+        --replace-fail 'Icon=/usr/share' "Icon=$out/share"
+    done
+
+    runHook postInstall
+  '';
+
+  meta = {
+    description = "GNU Emacs pgtk fork (prebuilt tarball)";
+    homepage = "https://github.com/WantenMN/emacs";
+    license = lib.licenses.gpl3Plus;
+    platforms = [ "x86_64-linux" ];
+    mainProgram = "emacs";
+  };
+}

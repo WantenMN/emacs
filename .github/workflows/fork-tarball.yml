@@ -1,0 +1,148 @@
+# Fork rolling tarball (traditional Linux packaging, no Nix).
+#
+# Push to release_fork -> autotools pgtk build on ubuntu-24.04, pack the
+# `DESTDIR` payload (contents of stage/usr: bin/ lib/ libexec/ share/) as
+# emacs-pgtk-linux-x86_64.tar.gz, force-move rolling tag `fork-linux-x86_64`,
+# upload, fill version/hash into dist/nix/emacs-fork.nix, upload that too,
+# then verify with a real `nix build` of the uploaded URL.
+#
+# dotfiles consumes this via pkgs/update-fork-tarballs.sh. Replaces cachix.
+name: Fork Tarball
+
+on:
+  push:
+    branches:
+      - release_fork
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-tarball-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ROLL_TAG: fork-linux-x86_64
+  TARBALL: emacs-pgtk-linux-x86_64.tar.gz
+  NIX_ASSET: emacs-fork.nix
+  NIXPKGS_TARBALL: https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst
+
+jobs:
+  tarball:
+    name: Build, publish and verify tarball
+    if: github.repository == 'WantenMN/emacs'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          show-progress: false
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          dotnet: false
+          large-packages: false
+
+      - name: Install build dependencies
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          sudo apt-get update
+          # Base set from the distro emacs recipe, plus pgtk/native-comp extras.
+          sudo apt-get build-dep -y emacs
+          sudo apt-get install -y autoconf texinfo pkg-config \
+            libgtk-3-dev libtree-sitter-dev libjansson-dev \
+            libharfbuzz-dev libotf-dev libm17n-dev || true
+          # libgccjit dev package is versioned; try unversioned then fall back.
+          sudo apt-get install -y libgccjit-dev \
+            || sudo apt-get install -y libgccjit-13-dev \
+            || sudo apt-get install -y libgccjit-14-dev
+
+      - name: Compute rolling version
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          ver_date=$(date -u +%Y.%m.%d)
+          echo "roll_version=32.0.50-${ver_date}-g${short_sha}" >> "$GITHUB_ENV"
+
+      - name: Autogen + configure (pgtk, prefix /usr)
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          ./autogen.sh
+          mkdir -p build
+          cd build
+          ../configure \
+            --with-pgtk \
+            --with-native-compilation \
+            --with-tree-sitter \
+            --prefix=/usr
+
+      - name: Build
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: make -C build -j"$(nproc)"
+
+      - name: Install to stage and pack tarball
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          rm -rf stage
+          mkdir -p stage
+          make -C build install DESTDIR="$PWD/stage"
+          printf 'version=%s\ncommit=%s\nconfigure=--with-pgtk --with-native-compilation --with-tree-sitter\n' \
+            "$roll_version" "$GITHUB_SHA" > stage/usr/BUILD-INFO.txt
+          tar -czf "$TARBALL" -C stage/usr .
+          ls -lh "$TARBALL"
+
+      - name: Smoke test staged payload
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          rm -rf /tmp/emacs-smoke
+          mkdir -p /tmp/emacs-smoke
+          tar -xzf "$TARBALL" -C /tmp/emacs-smoke
+          # Tarball top level is bin/ lib/ libexec/ share/ (no usr/ wrapper).
+          BIN=/tmp/emacs-smoke/bin/emacs
+          "$BIN" --version | head -n 3
+          "$BIN" --batch --eval '(message "emacs %s ts:%s" emacs-version (featurep (quote treesit)))'
+
+      - name: Install nix (verification only)
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: Publish tarball to rolling release
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag -f "$ROLL_TAG"
+          git push -f origin "$ROLL_TAG"
+          if ! gh release view "$ROLL_TAG" >/dev/null 2>&1; then
+            gh release create "$ROLL_TAG" \
+              --title "Emacs pgtk fork rolling (linux x86_64)" \
+              --notes "Rolling prebuilt tarball from release_fork. Nix consumers fetch ${NIX_ASSET}." \
+              --target release_fork
+          fi
+          gh release upload "$ROLL_TAG" "$TARBALL" --clobber
+
+      - name: Generate + publish verified .nix and verify nix build
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          url="https://github.com/WantenMN/emacs/releases/download/${ROLL_TAG}/${TARBALL}"
+          sri=$(nix store prefetch-file --json "$url" | jq -r .hash)
+          echo "sri: $sri"
+          if [ -z "$sri" ] || [ "$sri" = "null" ]; then
+            echo "error: failed to prefetch $url" >&2
+            exit 1
+          fi
+          sed -i -E \
+            -e "s|version = \".*\";|version = \"${roll_version}\";|" \
+            -e "s|hash = \"sha256-.*\";|hash = \"${sri}\";|" \
+            "dist/nix/${NIX_ASSET}"
+          grep -nE 'version = |url = |hash = ' "dist/nix/${NIX_ASSET}"
+          gh release upload "$ROLL_TAG" "dist/nix/${NIX_ASSET}" --clobber
+          out=$(nix build -L --impure --no-link --print-out-paths --expr \
+            "let pkgs = import (builtins.fetchTarball { url = \"$NIXPKGS_TARBALL\"; }) {}; in pkgs.callPackage ./dist/nix/${NIX_ASSET} {}")
+          echo "built: $out"
+          "$out/bin/emacs" --version | head -n 3
+          "$out/bin/emacs" --batch --eval '(kill-emacs 0)'
