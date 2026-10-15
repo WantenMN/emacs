@@ -80,6 +80,12 @@ stdenv.mkDerivation rec {
   ];
 
   # Tarball top level is bin/ lib/ libexec/ share/ (contents of stage/usr).
+  #
+  # The tree is built with --prefix=/usr, so the binary looks for lisp, etc
+  # and the pdumper file under /usr/... Redirect at runtime instead:
+  # EMACSLOADPATH replaces the baked lisp dir (subdirs are auto-added) and
+  # --dump-file overrides the baked pdumper location (mechanism verified
+  # against nixpkgs emacs: cc-mode loads, dump flag accepted).
   installPhase = ''
     runHook preInstall
 
@@ -96,6 +102,17 @@ stdenv.mkDerivation rec {
         --replace-fail 'Exec=/usr/bin' "Exec=$out/bin" \
         --replace-fail 'Icon=/usr/share' "Icon=$out/share"
     done
+
+    ever=$(ls "$out/share/emacs/" | grep -E '^[0-9]+\.' | head -n 1)
+    test -n "$ever"
+    test -d "$out/share/emacs/$ever/lisp"
+    pdmp=$(echo "$out"/libexec/emacs/*/*/emacs-*.pdmp)
+    test -f "$pdmp"
+    wrapProgram "$out/bin/emacs" \
+      --set EMACSLOADPATH "$out/share/emacs/$ever/lisp" \
+      --set EMACSDATA "$out/share/emacs/$ever/etc" \
+      --add-flags "--dump-file=$pdmp" \
+      --prefix XDG_DATA_DIRS : "$out/share:${gsettings-desktop-schemas}/share/gsettings-schemas/${gsettings-desktop-schemas.name}:${gtk3}/share/gsettings-schemas/${gtk3.name}"
 
     runHook postInstall
   '';

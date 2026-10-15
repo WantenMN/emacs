@@ -110,10 +110,17 @@ jobs:
           rm -rf /tmp/emacs-smoke
           mkdir -p /tmp/emacs-smoke
           tar -xzf "$TARBALL" -C /tmp/emacs-smoke
-          # Tarball top level is bin/ lib/ libexec/ share/ (no usr/ wrapper).
+          # Tarball top level is bin/ lib/ libexec/ share/ (no usr/ wrapper),
+          # but the tree is built with --prefix=/usr: redirect the baked
+          # paths the same way the nix wrapper does (env + dump flag).
           BIN=/tmp/emacs-smoke/bin/emacs
           "$BIN" --version | head -n 3
-          "$BIN" --batch --eval '(message "emacs %s ts:%s" emacs-version (featurep (quote treesit)))'
+          EVER=$(ls /tmp/emacs-smoke/share/emacs/ | grep -E '^[0-9]+\.' | head -n 1)
+          PDMP=$(echo /tmp/emacs-smoke/libexec/emacs/*/*/emacs-*.pdmp)
+          test -f "$PDMP"
+          EMACSLOADPATH=/tmp/emacs-smoke/share/emacs/"$EVER"/lisp \
+            "$BIN" --dump-file="$PDMP" --batch \
+            --eval '(progn (require (quote cc-mode)) (message "emacs %s ts:%s" emacs-version (featurep (quote treesit))))'
 
       - name: Install nix (verification only)
         uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
@@ -155,4 +162,6 @@ jobs:
             "let pkgs = import (builtins.fetchTarball { url = \"$NIXPKGS_TARBALL\"; }) {}; in pkgs.callPackage ./dist/nix/${NIX_ASSET} {}")
           echo "built: $out"
           "$out/bin/emacs" --version | head -n 3
-          "$out/bin/emacs" --batch --eval '(kill-emacs 0)'
+          # The wrapper sets EMACSLOADPATH + dump file; cc-mode proves the
+          # relocated lisp tree resolves (subdirs auto-added).
+          "$out/bin/emacs" --batch --eval "(progn (require 'cc-mode) (kill-emacs 0))"
