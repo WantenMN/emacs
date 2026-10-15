@@ -79,6 +79,44 @@ jobs:
           ver_date=$(date -u +%Y.%m.%d)
           echo "roll_version=32.0.50-${ver_date}-g${short_sha}" >> "$GITHUB_ENV"
 
+      - name: Build vendored tree-sitter 0.24 (old C API)
+        # emacs 32.0.50 still calls ts_language_version, which was removed in
+        # tree-sitter 0.25 (nixpkgs only ships 0.26) and Ubuntu noble only has
+        # 0.22 (too old for current grammars). Build 0.24.7 (last release with
+        # the old symbol) from the amalgamated lib.c, link emacs against it,
+        # and ship it. Both .so.0.24 (link SONAME) and .so.0.26 spellings are
+        # provided (same binary) to cover however emacs dlopens the library.
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          rm -rf vendor-ts
+          mkdir -p vendor-ts/lib vendor-ts/include vendor-ts/lib/pkgconfig
+          git clone --depth 1 --branch v0.24.7 \
+            https://github.com/tree-sitter/tree-sitter.git vendor-ts-src
+          cp -r vendor-ts-src/lib/include/tree_sitter vendor-ts/include/
+          cp vendor-ts-src/lib/src/parser.h vendor-ts/include/tree_sitter/ 2>/dev/null || true
+          cc -shared -fPIC -O2 \
+            -o vendor-ts/lib/libtree-sitter.so.0.24.7 \
+            vendor-ts-src/lib/src/lib.c \
+            -Ivendor-ts-src/lib/src -Ivendor-ts-src/lib/include \
+            -Wl,-soname,libtree-sitter.so.0.24
+          ln -s libtree-sitter.so.0.24.7 vendor-ts/lib/libtree-sitter.so.0.24
+          ln -s libtree-sitter.so.0.24.7 vendor-ts/lib/libtree-sitter.so.0.26
+          ln -s libtree-sitter.so.0.24 vendor-ts/lib/libtree-sitter.so
+          cat > vendor-ts/lib/pkgconfig/tree-sitter.pc <<'EOF'
+          prefix=__VENDOR_TS__
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+          Name: tree-sitter
+          Description: tree-sitter parser library (vendored 0.24.7)
+          Version: 0.24.7
+          Libs: -L${libdir} -ltree-sitter
+          Cflags: -I${includedir}
+          EOF
+          sed -i "s|__VENDOR_TS__|$PWD/vendor-ts|" vendor-ts/lib/pkgconfig/tree-sitter.pc
+          cat vendor-ts/lib/pkgconfig/tree-sitter.pc
+          echo "PKG_CONFIG_PATH=$PWD/vendor-ts/lib/pkgconfig" >> "$GITHUB_ENV"
+          ls -l vendor-ts/lib/
+
       - name: Autogen + configure (pgtk, prefix /usr)
         shell: bash --noprofile --norc -eo pipefail {0}
         run: |
@@ -95,7 +133,9 @@ jobs:
 
       - name: Build
         shell: bash --noprofile --norc -eo pipefail {0}
-        run: make -C build -j"$(nproc)"
+        run: |
+          make -C build -j"$(nproc)"
+          readelf -d build/src/emacs | grep -i tree || echo "no tree-sitter NEEDED"
 
       - name: Install to stage and pack tarball
         shell: bash --noprofile --norc -eo pipefail {0}
@@ -109,7 +149,9 @@ jobs:
           # inside our tarball like niri's libdisplay-info.
           cp -P /usr/lib/x86_64-linux-gnu/liblockfile.so.1* stage/usr/lib/
           cp -P /usr/lib/x86_64-linux-gnu/libjpeg.so.8* stage/usr/lib/
-          ls -l stage/usr/lib/ | grep -E "lockfile|libjpeg"
+          # Vendored tree-sitter 0.24.7 (see build step above).
+          cp -P vendor-ts/lib/libtree-sitter.so* stage/usr/lib/
+          ls -l stage/usr/lib/ | grep -E "lockfile|libjpeg|tree-sitter"
           printf 'version=%s\ncommit=%s\nconfigure=--with-pgtk --with-native-compilation --with-tree-sitter\n' \
             "$roll_version" "$GITHUB_SHA" > stage/usr/BUILD-INFO.txt
           tar -czf "$TARBALL" -C stage/usr .

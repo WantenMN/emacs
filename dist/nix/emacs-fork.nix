@@ -19,7 +19,6 @@
 , libtiff
 , sqlite
 , systemd
-, tree-sitter
 , libwebp
 , gmp
 , jansson
@@ -73,7 +72,6 @@ stdenv.mkDerivation rec {
     libtiff
     sqlite
     systemd
-    tree-sitter
     libwebp
     gmp
     jansson
