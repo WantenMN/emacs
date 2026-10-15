@@ -1,0 +1,272 @@
+# Fork rolling tarball (traditional Linux packaging, no Nix).
+#
+# Push to release_fork -> autotools pgtk build on ubuntu-24.04, pack the
+# `DESTDIR` payload (contents of stage/usr: bin/ lib/ libexec/ share/) as
+# emacs-pgtk-linux-x86_64.tar.gz, force-move rolling tag `fork-linux-x86_64`,
+# upload, fill version/hash into dist/nix/emacs-fork.nix, upload that too,
+# then verify with a real `nix build` of the uploaded URL.
+#
+# dotfiles consumes this via pkgs/update-fork-tarballs.sh. Replaces cachix.
+name: Fork Tarball
+
+on:
+  push:
+    branches:
+      - release_fork
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-tarball-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ROLL_TAG: fork-linux-x86_64
+  # Fixed-name pointer consumed by dotfiles (overwritten every run).
+  NIX_ASSET: emacs-fork.nix
+  # Versioned names (accumulate on the release, pruned to newest 10) are
+  # composed in the version step below.
+  NIXPKGS_TARBALL: https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst
+  KEEP_VERSIONS: "10"
+
+jobs:
+  tarball:
+    name: Build, publish and verify tarball
+    if: github.repository == 'WantenMN/emacs'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          show-progress: false
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          dotnet: false
+          large-packages: false
+
+      - name: Install build dependencies
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          sudo apt-get update
+          # build-dep needs deb-src entries (absent from runner images).
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+            sudo apt-get update
+          fi
+          # Base set from the distro emacs recipe, plus pgtk/native-comp extras.
+          if ! sudo apt-get build-dep -y emacs; then
+            sudo apt-get install -y autoconf texinfo pkg-config \
+              libgtk-3-dev libgnutls28-dev libsqlite3-dev libdbus-1-dev \
+              libotf-dev libm17n-dev libharfbuzz-dev libjpeg-dev \
+              libpng-dev libgif-dev libtiff-dev librsvg2-dev \
+              libwebp-dev liblcms2-dev libjansson-dev libgmp-dev \
+              libtree-sitter-dev libncurses-dev libxml2-dev zlib1g-dev \
+              libsystemd-dev
+          fi
+          # libgccjit dev package is versioned; try unversioned then fall back.
+          sudo apt-get install -y libgccjit-dev \
+            || sudo apt-get install -y libgccjit-13-dev \
+            || sudo apt-get install -y libgccjit-14-dev
+          # Runtime lib shipped inside the tarball (see install step).
+          sudo apt-get install -y liblockfile1 libjpeg-turbo8
+
+      - name: Compute rolling version
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          ver_date=$(date -u +%Y.%m.%d)
+          roll_version="32.0.50-${ver_date}-g${short_sha}"
+          echo "roll_version=${roll_version}" >> "$GITHUB_ENV"
+          # Versioned asset names accumulate on the rolling release (old
+          # versions are retained, pruned to newest $KEEP_VERSIONS at the end).
+          echo "TARBALL=emacs-pgtk-${roll_version}-linux-x86_64.tar.gz" >> "$GITHUB_ENV"
+          echo "NIX_VERSIONED=emacs-fork-${roll_version}.nix" >> "$GITHUB_ENV"
+
+      - name: Build vendored tree-sitter 0.24 (old C API)
+        # emacs 32.0.50 still calls ts_language_version, which was removed in
+        # tree-sitter 0.25 (nixpkgs only ships 0.26) and Ubuntu noble only has
+        # 0.22 (too old for current grammars). Build 0.24.7 (last release with
+        # the old symbol) from the amalgamated lib.c, link emacs against it,
+        # and ship it. Both .so.0.24 (link SONAME) and .so.0.26 spellings are
+        # provided (same binary) to cover however emacs dlopens the library.
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          rm -rf vendor-ts
+          mkdir -p vendor-ts/lib vendor-ts/include vendor-ts/lib/pkgconfig
+          git clone --depth 1 --branch v0.24.7 \
+            https://github.com/tree-sitter/tree-sitter.git vendor-ts-src
+          cp -r vendor-ts-src/lib/include/tree_sitter vendor-ts/include/
+          cp vendor-ts-src/lib/src/parser.h vendor-ts/include/tree_sitter/ 2>/dev/null || true
+          cc -shared -fPIC -O2 \
+            -o vendor-ts/lib/libtree-sitter.so.0.24.7 \
+            vendor-ts-src/lib/src/lib.c \
+            -Ivendor-ts-src/lib/src -Ivendor-ts-src/lib/include \
+            -Wl,-soname,libtree-sitter.so.0.24
+          ln -s libtree-sitter.so.0.24.7 vendor-ts/lib/libtree-sitter.so.0.24
+          ln -s libtree-sitter.so.0.24.7 vendor-ts/lib/libtree-sitter.so.0.26
+          ln -s libtree-sitter.so.0.24 vendor-ts/lib/libtree-sitter.so
+          cat > vendor-ts/lib/pkgconfig/tree-sitter.pc <<'EOF'
+          prefix=__VENDOR_TS__
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+          Name: tree-sitter
+          Description: tree-sitter parser library (vendored 0.24.7)
+          Version: 0.24.7
+          Libs: -L${libdir} -ltree-sitter
+          Cflags: -I${includedir}
+          EOF
+          sed -i "s|__VENDOR_TS__|$PWD/vendor-ts|" vendor-ts/lib/pkgconfig/tree-sitter.pc
+          cat vendor-ts/lib/pkgconfig/tree-sitter.pc
+          echo "PKG_CONFIG_PATH=$PWD/vendor-ts/lib/pkgconfig" >> "$GITHUB_ENV"
+          # temacs (bootstrap) must load the vendored lib at build time.
+          echo "LD_LIBRARY_PATH=$PWD/vendor-ts/lib" >> "$GITHUB_ENV"
+          ls -l vendor-ts/lib/
+
+      - name: Autogen + configure (pgtk, prefix /usr)
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          ./autogen.sh
+          mkdir -p build
+          cd build
+          ../configure \
+            --with-pgtk \
+            --with-native-compilation \
+            --with-tree-sitter \
+            --without-xml2 \
+            --without-gpm \
+            --prefix=/usr
+
+      - name: Build
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          make -C build -j"$(nproc)"
+          readelf -d build/src/emacs | grep -i tree || echo "no tree-sitter NEEDED"
+
+      - name: Install to stage and pack tarball
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          rm -rf stage
+          mkdir -p stage
+          make -C build install DESTDIR="$PWD/stage"
+          # movemail links liblockfile.so.1, emacs links libjpeg.so.8; nixpkgs
+          # provides neither (its liblockfile ships no .so, its jpeg is
+          # .so.62-only). Ubuntu's are trivial (libc-only), so ship them
+          # inside our tarball like niri's libdisplay-info.
+          cp -P /usr/lib/x86_64-linux-gnu/liblockfile.so.1* stage/usr/lib/
+          cp -P /usr/lib/x86_64-linux-gnu/libjpeg.so.8* stage/usr/lib/
+          # Vendored tree-sitter 0.24.7 (see build step above).
+          cp -P vendor-ts/lib/libtree-sitter.so* stage/usr/lib/
+          ls -l stage/usr/lib/ | grep -E "lockfile|libjpeg|tree-sitter"
+          printf 'version=%s\ncommit=%s\nconfigure=--with-pgtk --with-native-compilation --with-tree-sitter\n' \
+            "$roll_version" "$GITHUB_SHA" > stage/usr/BUILD-INFO.txt
+          tar -czf "$TARBALL" -C stage/usr .
+          ls -lh "$TARBALL"
+
+      - name: Smoke test staged payload
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          rm -rf /tmp/emacs-smoke
+          mkdir -p /tmp/emacs-smoke
+          tar -xzf "$TARBALL" -C /tmp/emacs-smoke
+          # Tarball top level is bin/ lib/ libexec/ share/ (no usr/ wrapper),
+          # but the tree is built with --prefix=/usr: redirect the baked
+          # paths the same way the nix wrapper does (env + dump flag).
+          BIN=/tmp/emacs-smoke/bin/emacs
+          "$BIN" --version | head -n 3
+          EVER=$(ls /tmp/emacs-smoke/share/emacs/ | grep -E '^[0-9]+\.' | head -n 1)
+          PDMP=$(echo /tmp/emacs-smoke/libexec/emacs/*/*/emacs-*.pdmp)
+          test -f "$PDMP"
+          EMACSLOADPATH=/tmp/emacs-smoke/share/emacs/"$EVER"/lisp \
+            "$BIN" --dump-file="$PDMP" --batch \
+            --eval '(progn (require (quote cc-mode)) (message "emacs %s ts:%s" emacs-version (featurep (quote treesit))))'
+
+      - name: Install nix (verification only)
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: Publish tarball to versioned release
+        # One release per version (never overwritten): old versions stay
+        # downloadable for stale machines. Re-runs of the same commit reuse
+        # the same tag (idempotent create + clobber upload).
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ver_tag="fork-${roll_version}"
+          echo "ver_tag=${ver_tag}" >> "$GITHUB_ENV"
+          git tag -f "$ver_tag"
+          git push -f origin "$ver_tag"
+          if ! gh release view "$ver_tag" >/dev/null 2>&1; then
+            gh release create "$ver_tag" \
+              --title "Emacs pgtk fork ${roll_version}" \
+              --notes "Prebuilt emacs-pgtk ${roll_version} from release_fork (${GITHUB_SHA})." \
+              --target release_fork
+          fi
+          gh release upload "$ver_tag" "$TARBALL" --clobber
+
+      - name: Generate + publish verified .nix and verify nix build
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          url="https://github.com/WantenMN/emacs/releases/download/${ver_tag}/${TARBALL}"
+          sri=$(nix store prefetch-file --json "$url" | jq -r .hash)
+          echo "sri: $sri"
+          if [ -z "$sri" ] || [ "$sri" = "null" ]; then
+            echo "error: failed to prefetch $url" >&2
+            exit 1
+          fi
+          sed -i -E \
+            -e "s|version = \".*\";|version = \"${roll_version}\";|" \
+            -e "s|url = \".*\";|url = \"${url}\";|" \
+            -e "s|hash = \"sha256-.*\";|hash = \"${sri}\";|" \
+            "dist/nix/${NIX_ASSET}"
+          grep -nE 'version = |url = |hash = ' "dist/nix/${NIX_ASSET}"
+          # Versioned asset (retained on its own release) + fixed-name pointer
+          # (rolling tag, dotfiles target).
+          cp "dist/nix/${NIX_ASSET}" "dist/nix/${NIX_VERSIONED}"
+          gh release upload "$ver_tag" "dist/nix/${NIX_VERSIONED}" --clobber
+          git tag -f "$ROLL_TAG"
+          git push -f origin "$ROLL_TAG"
+          if ! gh release view "$ROLL_TAG" >/dev/null 2>&1; then
+            gh release create "$ROLL_TAG" \
+              --title "Emacs pgtk fork rolling pointers" \
+              --notes "Fixed-name .nix pointers to the newest versioned releases. Each version has its own release; old versions are retained (newest 10)." \
+              --target release_fork
+          fi
+          gh release upload "$ROLL_TAG" "dist/nix/${NIX_ASSET}" --clobber
+          out=$(nix build -L --impure --no-link --print-out-paths --expr \
+            "let pkgs = import (builtins.fetchTarball { url = \"$NIXPKGS_TARBALL\"; }) {}; in pkgs.callPackage ./dist/nix/${NIX_ASSET} {}")
+          echo "built: $out"
+          "$out/bin/emacs" --version | head -n 3
+          # The wrapper sets EMACSLOADPATH + dump file; cc-mode proves the
+          # relocated lisp tree resolves (subdirs auto-added).
+          "$out/bin/emacs" --batch --eval "(progn (require 'cc-mode) (kill-emacs 0))"
+
+      - name: Prune old versioned releases (keep newest)
+        # Old versions are separate releases so stale machines can reinstall
+        # the exact version their dotfiles pin; only releases beyond the
+        # newest $KEEP_VERSIONS are deleted (release + tag). The rolling
+        # pointer release is never touched.
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tags=$(gh release list --limit 100 --json tagName,createdAt \
+            --jq -r 'sort_by(.createdAt) | reverse | .[].tagName' \
+            | grep -E '^fork-' | grep -v -x "$ROLL_TAG" || true)
+          count=$(echo "$tags" | grep -c . || true)
+          count=${count:-0}
+          if [ "$count" -gt "$KEEP_VERSIONS" ]; then
+            echo "$tags" | tail -n +"$((KEEP_VERSIONS + 1))" | while IFS= read -r t; do
+              [ -n "$t" ] || continue
+              echo "pruning old versioned release: $t"
+              gh release delete "$t" --cleanup-tag -y
+            done
+          else
+            echo "keeping all $count versioned release(s)"
+          fi
