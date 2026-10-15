@@ -94,13 +94,18 @@ stdenv.mkDerivation rec {
       [ -e "$d" ] && cp -r "$d" "$out/"
     done
 
-    # Desktop files bake the /usr bindir; point them at the store.
+    # Desktop files may bake the /usr bindir or use bare names depending on
+    # the toolkit build; normalize any form to the store wrapper.
     for f in $out/share/applications/emacs.desktop \
              $out/share/applications/emacsclient.desktop \
              $out/share/applications/emacs-mail.desktop; do
-      [ -f "$f" ] && substituteInPlace "$f" \
-        --replace-fail 'Exec=/usr/bin' "Exec=$out/bin" \
-        --replace-fail 'Icon=/usr/share' "Icon=$out/share"
+      [ -f "$f" ] || continue
+      grep -q '^Exec=' "$f" || { echo "error: no Exec= in $f" >&2; exit 1; }
+      sed -i -E \
+        -e "s|^Exec=(/usr/bin/)?|Exec=$out/bin/|" \
+        -e "s|^TryExec=(/usr/bin/)?|TryExec=$out/bin/|" \
+        -e "s|^Icon=(/usr/share/)?|Icon=$out/share/|" \
+        "$f"
     done
 
     ever=$(ls "$out/share/emacs/" | grep -E '^[0-9]+\.' | head -n 1)
