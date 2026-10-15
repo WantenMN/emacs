@@ -5,7 +5,6 @@
 , makeWrapper
 , gnutls
 , harfbuzz
-, libxml2
 , ncurses
 , dbus
 , gsettings-desktop-schemas
@@ -27,7 +26,6 @@
 , jansson
 , libotf
 , lcms2
-, liblockfile
 }:
 
 # Emacs pgtk fork (traditional tarball from GitHub Release).
@@ -59,7 +57,6 @@ stdenv.mkDerivation rec {
   buildInputs = [
     gnutls
     harfbuzz
-    libxml2
     ncurses
     dbus
     gsettings-desktop-schemas
@@ -81,7 +78,6 @@ stdenv.mkDerivation rec {
     jansson
     libotf
     lcms2
-    liblockfile
     stdenv.cc.cc.lib
   ];
 

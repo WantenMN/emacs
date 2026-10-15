@@ -69,6 +69,8 @@ jobs:
           sudo apt-get install -y libgccjit-dev \
             || sudo apt-get install -y libgccjit-13-dev \
             || sudo apt-get install -y libgccjit-14-dev
+          # Runtime lib shipped inside the tarball (see install step).
+          sudo apt-get install -y liblockfile1
 
       - name: Compute rolling version
         shell: bash --noprofile --norc -eo pipefail {0}
@@ -87,6 +89,8 @@ jobs:
             --with-pgtk \
             --with-native-compilation \
             --with-tree-sitter \
+            --without-xml2 \
+            --without-gpm \
             --prefix=/usr
 
       - name: Build
@@ -99,6 +103,11 @@ jobs:
           rm -rf stage
           mkdir -p stage
           make -C build install DESTDIR="$PWD/stage"
+          # movemail links liblockfile.so.1, which nixpkgs cannot provide
+          # (its liblockfile ships no .so); Ubuntu's is trivial (libc-only),
+          # so ship it inside our tarball like niri's libdisplay-info.
+          cp -P /usr/lib/x86_64-linux-gnu/liblockfile.so.1* stage/usr/lib/
+          ls -l stage/usr/lib/ | grep lockfile
           printf 'version=%s\ncommit=%s\nconfigure=--with-pgtk --with-native-compilation --with-tree-sitter\n' \
             "$roll_version" "$GITHUB_SHA" > stage/usr/BUILD-INFO.txt
           tar -czf "$TARBALL" -C stage/usr .
