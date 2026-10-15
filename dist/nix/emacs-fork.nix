@@ -25,6 +25,9 @@
 , libwebp
 , gmp
 , jansson
+, libotf
+, lcms2
+, liblockfile
 }:
 
 # Emacs pgtk fork (traditional tarball from GitHub Release).
@@ -76,6 +79,9 @@ stdenv.mkDerivation rec {
     libwebp
     gmp
     jansson
+    libotf
+    lcms2
+    liblockfile
     stdenv.cc.cc.lib
   ];
 
